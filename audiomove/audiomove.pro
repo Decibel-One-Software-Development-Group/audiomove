@@ -1,6 +1,13 @@
 CONFIG     += qt warn_on release thread rtti link_prl
 
 mac {
+   # Without this, qmake stamps the bundle with its placeholder identifier
+   # "com.yourcompany.AudioMove".  Modern macOS keys TCC privacy grants (Files
+   # and Folders, Desktop, Documents) off the bundle identifier, so leaving the
+   # placeholder in place makes AudioMove share its permission record with every
+   # other default-qmake app on the system.
+   QMAKE_TARGET_BUNDLE_PREFIX = com.meyersound
+
    BUILD_UNIVERSAL_BINARY = $$(BUILD_UNIVERSAL_BINARY)
    isEmpty(BUILD_UNIVERSAL_BINARY) {
       warning("Environment variable BUILD_UNIVERSAL_BINARY not detected:  Building for native architecture only")
