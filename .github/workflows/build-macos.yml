@@ -1,0 +1,207 @@
+# Build a universal (x86_64 + arm64) AudioMove.app on a GitHub macOS runner.
+#
+# Decibel One build pipeline -- not part of the upstream project.
+#
+# Building needs no credentials at all.  Signing and notarizing are OPTIONAL and
+# switch themselves on only when the corresponding secrets exist, so this
+# workflow is useful immediately and starts producing distributable builds the
+# moment the secrets are added.
+#
+# To enable signing + notarization, add these repository secrets:
+#
+#   MACOS_CERTIFICATE       base64 of a "Developer ID Application" .p12
+#                             base64 -i cert.p12 | pbcopy
+#   MACOS_CERTIFICATE_PWD   the password you set when exporting the .p12
+#   MACOS_NOTARY_KEY        base64 of an App Store Connect API key (.p8)
+#   MACOS_NOTARY_KEY_ID     the key's Key ID
+#   MACOS_NOTARY_ISSUER     the issuer UUID from App Store Connect
+#
+# An App Store Connect API key is preferred over an Apple ID + app-specific
+# password: it is independently revocable and carries no account password.
+
+name: Build macOS (universal)
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    env:
+      QT_VERSION: 6.11.1
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      # Resolved once here, because the secrets context is awkward to test
+      # directly inside step-level 'if' conditions.
+      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_NOTARY: ${{ secrets.MACOS_NOTARY_KEY != '' }}
+
+    steps:
+      - name: Check out (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          # GNU AutoGen is the non-obvious one: libsndfile needs it to generate
+          # src/test_endswap.c, and its build stops without it.
+          brew install autoconf automake libtool autogen pkg-config
+
+      - name: Install universal Qt
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aqt"
+          "$RUNNER_TEMP/aqt/bin/pip" install -q aqtinstall
+          "$RUNNER_TEMP/aqt/bin/aqt" install-qt mac desktop "$QT_VERSION" clang_64 \
+              --archives qtbase --outputdir "$RUNNER_TEMP/Qt"
+          echo "$RUNNER_TEMP/Qt/$QT_VERSION/macos/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Qt is universal
+        run: |
+          QTCORE="$RUNNER_TEMP/Qt/$QT_VERSION/macos/lib/QtCore.framework/Versions/A/QtCore"
+          ARCHS=$(lipo -archs "$QTCORE")
+          echo "Qt architectures: $ARCHS"
+          case "$ARCHS" in
+            *x86_64*arm64*|*arm64*x86_64*) ;;
+            *) echo "::error::Qt is not universal; a universal .app cannot be linked"; exit 1 ;;
+          esac
+
+      - name: Build
+        env:
+          BUILD_UNIVERSAL_BINARY: "1"
+        run: |
+          # BSD libtool is not the GNU one the submodules expect.
+          export PATH="$(brew --prefix libtool)/libexec/gnubin:$PATH"
+          export MAKEFLAGS="-j$(sysctl -n hw.ncpu)"
+          source ./build-audiomove.sh
+
+      - name: Bundle Qt into the app
+        run: |
+          test -d audiomove/AudioMove.app || { echo "::error::build produced no app bundle"; exit 1; }
+          macdeployqt audiomove/AudioMove.app -always-overwrite
+
+      - name: Verify every binary is universal
+        run: |
+          # A single thin component would fail on Intel in the field, so this is
+          # a hard gate rather than an informational step.
+          BAD=0
+          while IFS= read -r f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+              A=$(lipo -archs "$f" 2>/dev/null || echo "")
+              case "$A" in
+                *x86_64*arm64*|*arm64*x86_64*) ;;
+                *) echo "::error::not universal: $f [$A]"; BAD=1 ;;
+              esac
+            fi
+          done < <(find audiomove/AudioMove.app -type f)
+          [ "$BAD" -eq 0 ] || exit 1
+          echo "All Mach-O files carry both architectures."
+
+      - name: Smoke test both slices
+        run: |
+          # Prove it actually converts on each architecture, not merely that it
+          # linked.  Apple Silicon runners may lack Rosetta, so the x86_64 half
+          # is best-effort rather than a hard failure.
+          AM=audiomove/AudioMove.app/Contents/MacOS/AudioMove
+          say -o "$RUNNER_TEMP/src.aiff" "Testing AudioMove build."
+          afconvert -f WAVE -d LEI16@44100 "$RUNNER_TEMP/src.aiff" "$RUNNER_TEMP/src.wav"
+          for ARCH in arm64 x86_64; do
+            if ! arch -$ARCH /usr/bin/true 2>/dev/null; then
+              echo "::warning::cannot execute $ARCH on this runner - skipping its smoke test"
+              continue
+            fi
+            OUT="$RUNNER_TEMP/out-$ARCH"; mkdir -p "$OUT"
+            arch -$ARCH "$AM" "$RUNNER_TEMP/src.wav" dest="$OUT" \
+                format=FLAC rate=48 width=Source quit=force
+            if [ -z "$(ls -A "$OUT")" ] || ls "$OUT" | grep -q audiomove_temp; then
+              echo "::error::$ARCH slice failed to convert"; exit 1
+            fi
+            echo "$ARCH slice converted: $(ls "$OUT")"
+          done
+
+      # ---- Signing and notarization: only when the secrets are configured ----
+
+      - name: Import signing certificate
+        id: cert
+        if: env.HAS_CERT == 'true'
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PWD=$(uuidgen)
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PWD" -T /usr/bin/codesign
+          # Without this, codesign blocks on a GUI prompt nobody can answer.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+                  | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/' || true)
+          [ -n "$IDENT" ] || { echo "::error::no Developer ID Application cert inside that .p12"; exit 1; }
+          echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
+
+      - name: Sign
+        if: env.HAS_CERT == 'true'
+        run: |
+          APP=audiomove/AudioMove.app
+          IDENT="${{ steps.cert.outputs.identity }}"
+          # Nested code first: sealing the outer bundle invalidates anything
+          # signed after it.  --options runtime is required for notarization.
+          find "$APP/Contents" \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) \
+            | awk '{print gsub(/\//,"/"), $0}' | sort -rn | cut -d' ' -f2- \
+            | while IFS= read -r item; do
+                codesign --force --sign "$IDENT" --options runtime --timestamp "$item"
+              done
+          codesign --force --sign "$IDENT" --options runtime --timestamp "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Notarize and staple
+        if: env.HAS_CERT == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          echo "$KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          # ditto, not zip: zip mangles the framework symlinks.
+          ditto -c -k --keepParent audiomove/AudioMove.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+              --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+          xcrun stapler staple audiomove/AudioMove.app
+          xcrun stapler validate audiomove/AudioMove.app
+          spctl -a -t exec -vvv audiomove/AudioMove.app
+
+      # ---- Package ----------------------------------------------------------
+
+      - name: Package
+        id: package
+        run: |
+          VER=$(sed -nE 's/.*VERSION_STRING[[:space:]]+"([^"]+)".*/\1/p' \
+                audiomove/AudioMoveConstants.h | head -1)
+          NAME="AudioMove${VER:-dev}_MacOS_Universal"
+          ditto -c -k --keepParent audiomove/AudioMove.app "$NAME.zip"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          shasum -a 256 "$NAME.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+              "${{ steps.package.outputs.name }}.zip" --clobber
