@@ -3,21 +3,23 @@
 # Decibel One build pipeline -- not part of the upstream project.
 #
 # Building needs no credentials at all.  Signing and notarizing are OPTIONAL and
-# switch themselves on only when the corresponding secrets exist, so this
+# switch themselves on only when the secrets are visible to this repo, so the
 # workflow is useful immediately and starts producing distributable builds the
-# moment the secrets are added.
+# moment they are.
 #
-# To enable signing + notarization, add these repository secrets:
+# The secret names below deliberately match the ones sigentest/release.yml
+# already uses, so if these are defined as ORGANISATION secrets available to
+# this repo, signing works with no further setup:
 #
-#   MACOS_CERTIFICATE       base64 of a "Developer ID Application" .p12
-#                             base64 -i cert.p12 | pbcopy
-#   MACOS_CERTIFICATE_PWD   the password you set when exporting the .p12
-#   MACOS_NOTARY_KEY        base64 of an App Store Connect API key (.p8)
-#   MACOS_NOTARY_KEY_ID     the key's Key ID
-#   MACOS_NOTARY_ISSUER     the issuer UUID from App Store Connect
-#
-# An App Store Connect API key is preferred over an Apple ID + app-specific
-# password: it is independently revocable and carries no account password.
+#   APPLE_DEVELOPER_ID_CERTIFICATE_BASE64    base64 of the Developer ID
+#                                            Application .p12
+#   APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD  its export password
+#   APPLE_CERTIFICATE_NAME                   the identity string, e.g.
+#                                            "Developer ID Application: ... (TEAMID)"
+#   APP_STORE_CONNECT_API_KEY                the .p8 contents (raw, NOT base64 --
+#                                            matching sigentest's convention)
+#   APP_STORE_CONNECT_API_KEY_ID             the key's Key ID
+#   APP_STORE_CONNECT_API_ISSUER_ID          the issuer UUID
 
 name: Build macOS (universal)
 
@@ -36,8 +38,8 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
       # Resolved once here, because the secrets context is awkward to test
       # directly inside step-level 'if' conditions.
-      HAS_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
-      HAS_NOTARY: ${{ secrets.MACOS_NOTARY_KEY != '' }}
+      HAS_CERT: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 != '' }}
+      HAS_NOTARY: ${{ secrets.APP_STORE_CONNECT_API_KEY != '' }}
 
     steps:
       - name: Check out (with submodules)
@@ -128,23 +130,34 @@ jobs:
         id: cert
         if: env.HAS_CERT == 'true'
         env:
-          CERT: ${{ secrets.MACOS_CERTIFICATE }}
-          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          CERT_NAME: ${{ secrets.APPLE_CERTIFICATE_NAME }}
         run: |
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PWD=$(uuidgen)
-          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PWD" -T /usr/bin/codesign
-          # Without this, codesign blocks on a GUI prompt nobody can answer.
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN"
-          rm -f "$RUNNER_TEMP/cert.p12"
-          IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
-                  | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/' || true)
-          [ -n "$IDENT" ] || { echo "::error::no Developer ID Application cert inside that .p12"; exit 1; }
+          # Mirrors sigentest/release.yml's import, which is known to work on
+          # these runners -- same keychain handling and the same partition list.
+          KEYCHAIN_PATH="$RUNNER_TEMP/audiomove-build.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$CERT_BASE64" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$CERT_PASSWORD" \
+            -t cert -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/xcrun
+          # Without the partition list, codesign blocks on a GUI prompt nobody
+          # can answer and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+          rm -f "$CERT_PATH"
+          security find-identity -p codesigning -v
+          IDENT="$CERT_NAME"
+          if [ -z "$IDENT" ]; then
+            IDENT=$(security find-identity -v -p codesigning \
+                    | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/' || true)
+          fi
+          [ -n "$IDENT" ] || { echo "::error::no Developer ID Application identity available"; exit 1; }
           echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
 
       - name: Sign
@@ -165,16 +178,21 @@ jobs:
       - name: Notarize and staple
         if: env.HAS_CERT == 'true' && env.HAS_NOTARY == 'true'
         env:
-          KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          API_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          ISSUER: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
         run: |
-          echo "$KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          # Note: sigentest stores the .p8 contents raw, not base64, so this
+          # writes it out directly rather than decoding.
+          mkdir -p "$RUNNER_TEMP/notary"
+          KEY_FILE="$RUNNER_TEMP/notary/AuthKey_${KEY_ID}.p8"
+          printf '%s' "$API_KEY_CONTENT" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
           # ditto, not zip: zip mangles the framework symlinks.
           ditto -c -k --keepParent audiomove/AudioMove.app "$RUNNER_TEMP/notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-              --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" --wait
-          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip"
+              --key "$KEY_FILE" --key-id "$KEY_ID" --issuer "$ISSUER" --wait
+          rm -f "$KEY_FILE" "$RUNNER_TEMP/notarize.zip"
           xcrun stapler staple audiomove/AudioMove.app
           xcrun stapler validate audiomove/AudioMove.app
           spctl -a -t exec -vvv audiomove/AudioMove.app
